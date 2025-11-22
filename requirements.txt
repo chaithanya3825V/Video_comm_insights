@@ -1,6 +1,7 @@
+pip==23.2
+yt-dlp==2023.12.30
 audioop
 processing
-yt-dlp
 streamlit
 groq
 moviepy
