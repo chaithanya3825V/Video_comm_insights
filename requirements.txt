@@ -1,3 +1,4 @@
+pyaudioop
 processing
 yt-dlp
 streamlit
