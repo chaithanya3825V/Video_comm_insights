@@ -1,3 +1,6 @@
+processing
+pyaudioop
+yt-dlp
 streamlit
 groq
 moviepy
