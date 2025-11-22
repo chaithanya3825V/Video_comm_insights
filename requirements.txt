@@ -1,4 +1,6 @@
 pip==23.2
+setuptools
+wheel
 yt-dlp==2023.12.30
 audioop
 processing
