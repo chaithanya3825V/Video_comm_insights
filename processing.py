@@ -40,10 +40,10 @@ def _get_duration_seconds(path: str) -> float:
         raise RuntimeError(f"Could not determine duration for file: {path}")
 
 
-def download_video(url: str) -> str:
+def download_video(url: str) -> Tuple[str, str]:
     """
     Download a direct MP4/video from a public URL to a temp file.
-    Returns path to downloaded video (MP4).
+    Returns (video_path, tmp_dir).
     """
     tmp_dir = tempfile.mkdtemp()
     out_path = os.path.join(tmp_dir, "video.mp4")
@@ -60,13 +60,12 @@ def download_video(url: str) -> str:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError("Downloaded file is missing or too small; ensure the URL is a direct public MP4 link.")
 
-    # return the full path (caller may want to keep tmp_dir if cleanup needed)
     return out_path, tmp_dir
 
 
-def extract_audio(video_path: str) -> Tuple[str, float]:
+def extract_audio(video_path: str) -> Tuple[str, float, str]:
     """
-    Extract 16kHz mono WAV from video, run loudnorm + small boost, and return (clean_wav_path, duration_seconds).
+    Extract 16kHz mono WAV from video, run loudnorm + small boost, and return (clean_wav_path, duration_seconds, tmp_dir).
     Uses ffmpeg/ffprobe; no pydub/moviepy required.
     """
     tmp_dir = tempfile.mkdtemp()
@@ -120,7 +119,7 @@ def extract_audio(video_path: str) -> Tuple[str, float]:
         raise RuntimeError("Audio processing failed; normalized file missing or too small.")
 
     # Return the clean audio path and duration (caller may choose to cleanup the temp dir)
-    return clean_audio, float(duration_sec), tmp_dir
+    return clean_wav, float(duration_sec), tmp_dir
 
 
 def transcribe_audio(audio_path: str) -> str:
@@ -146,9 +145,7 @@ def transcribe_audio(audio_path: str) -> str:
     _run_cmd(cmd_segment)
 
     # collect chunk files sorted
-    chunks = sorted(
-        [os.path.join(audio_tmp_dir, f) for f in os.listdir(audio_tmp_dir) if f.endswith(".wav")]
-    )
+    chunks = sorted([os.path.join(audio_tmp_dir, f) for f in os.listdir(audio_tmp_dir) if f.endswith(".wav")])
     if not chunks:
         shutil.rmtree(audio_tmp_dir, ignore_errors=True)
         raise RuntimeError("No audio chunks were produced by ffmpeg segmentation.")
@@ -179,8 +176,13 @@ def transcribe_audio(audio_path: str) -> str:
 
     # combine and return
     return " ".join(p for p in transcript_parts if p).strip()
-    def cleanup_dirs(*dirs):
-    import shutil
+
+
+def cleanup_dirs(*dirs):
+    """
+    Remove any temporary directories (ignore errors).
+    Pass the tmp_dir values returned by download_video and extract_audio.
+    """
     for d in dirs:
         if d and os.path.exists(d):
             try:
