@@ -3,36 +3,36 @@ import os
 import tempfile
 import shutil
 import subprocess
-from typing import Tuple, Optional
+from typing import Tuple
 import requests
-import yt_dlp
 from groq import Groq, APIStatusError
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# each chunk length for transcription (seconds)
+# chunk length used for transcription (seconds)
 CHUNK_DURATION_SEC = 50
-# chunk filename template
+# output chunk filename template (ffmpeg segment will create chunk_000.wav, chunk_001.wav, ...)
 CHUNK_FILENAME = "chunk_%03d.wav"
 
 
-def _run_cmd(cmd: list, check=True):
-    """Run a command and raise a helpful error if it fails."""
-    try:
-        subprocess.run(cmd, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\nexit={e.returncode}\nstderr={e.stderr.decode(errors='ignore')}")
+def _run_cmd(cmd: list, check: bool = True) -> subprocess.CompletedProcess:
+    """Run subprocess and raise helpful error on failure."""
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and proc.returncode != 0:
+        stderr = proc.stderr.decode(errors="ignore")
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}\nexit={proc.returncode}\nstderr={stderr}")
+    return proc
 
 
 def _get_duration_seconds(path: str) -> float:
-    """Return duration in seconds using ffprobe (part of ffmpeg)."""
+    """Return duration using ffprobe."""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         path
     ]
-    proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = _run_cmd(cmd)
     out = proc.stdout.decode().strip()
     try:
         return float(out)
@@ -40,75 +40,40 @@ def _get_duration_seconds(path: str) -> float:
         raise RuntimeError(f"Could not determine duration for file: {path}")
 
 
-def download_video(url: str, max_duration_sec: Optional[int] = None) -> Tuple[str, str]:
+def download_video(url: str) -> str:
     """
-    Download video with yt-dlp (fallback to requests for direct mp4).
-    Returns (video_path, tmp_dir).
+    Download a direct MP4/video from a public URL to a temp file.
+    Returns path to downloaded video (MP4).
     """
     tmp_dir = tempfile.mkdtemp()
-    outtmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
-    ydl_opts = {
-        "outtmpl": outtmpl,
-        "format": "bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "nocheckcertificate": True,
-        "retries": 3,
-    }
+    out_path = os.path.join(tmp_dir, "video.mp4")
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            duration = info.get("duration")
-            if max_duration_sec is not None and duration is not None and duration > max_duration_sec:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                raise RuntimeError(f"Video duration {duration}s exceeds limit of {max_duration_sec}s.")
+    with requests.get(url, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
 
-            downloaded_path = ydl.prepare_filename(info)
-            # ensure mp4 extension if merged
-            if not downloaded_path.lower().endswith(".mp4"):
-                alt = os.path.splitext(downloaded_path)[0] + ".mp4"
-                if os.path.exists(alt):
-                    downloaded_path = alt
+    # basic sanity check
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError("Downloaded file is missing or too small; ensure the URL is a direct public MP4 link.")
 
-            if not os.path.exists(downloaded_path):
-                files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)]
-                if not files:
-                    raise RuntimeError("yt-dlp produced no files.")
-                downloaded_path = max(files, key=os.path.getsize)
-
-            return downloaded_path, tmp_dir
-
-    except Exception as e_ydl:
-        # fallback for raw mp4 urls
-        try:
-            out_path = os.path.join(tmp_dir, "video.mp4")
-            with requests.get(url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                with open(out_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-            if os.path.getsize(out_path) < 1024:
-                raise RuntimeError("Downloaded file is too small; probably not a valid media file.")
-            return out_path, tmp_dir
-        except Exception as e_requests:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise RuntimeError(f"Download failed. yt-dlp error: {e_ydl}; requests fallback error: {e_requests}")
+    # return the full path (caller may want to keep tmp_dir if cleanup needed)
+    return out_path
 
 
-def extract_audio(video_path: str) -> Tuple[str, float, str]:
+def extract_audio(video_path: str) -> Tuple[str, float]:
     """
-    Use ffmpeg to extract a 16kHz mono WAV, normalize and boost volume.
-    Returns (clean_wav_path, duration_seconds, tmp_dir_for_audio).
+    Extract 16kHz mono WAV from video, run loudnorm + small boost, and return (clean_wav_path, duration_seconds).
+    Uses ffmpeg/ffprobe; no pydub/moviepy required.
     """
     tmp_dir = tempfile.mkdtemp()
     raw_wav = os.path.join(tmp_dir, "raw.wav")
     clean_wav = os.path.join(tmp_dir, "clean.wav")
 
-    # Extract wav (16kHz mono, signed 16-bit)
+    # extract audio to WAV (16kHz mono s16)
     cmd_extract = [
         "ffmpeg", "-y",
         "-i", video_path,
@@ -120,38 +85,27 @@ def extract_audio(video_path: str) -> Tuple[str, float, str]:
     ]
     _run_cmd(cmd_extract)
 
-    # get duration from ffprobe
+    # determine duration (seconds)
     duration_sec = _get_duration_seconds(raw_wav)
 
-    # quick silence check using ffmpeg's astats to get mean level OR use ffmpeg to compute max volume
-    # here we use ffmpeg -i raw.wav -af volumedetect to get max_volume (safer for hosted env)
-    probe_cmd = [
-        "ffmpeg", "-i", raw_wav, "-af", "volumedetect",
-        "-f", "null", "-"
-    ]
+    # detect max volume using ffmpeg volumedetect (parses stderr)
+    probe_cmd = ["ffmpeg", "-i", raw_wav, "-af", "volumedetect", "-f", "null", "-"]
     proc = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stderr = proc.stderr.decode(errors="ignore")
-    # look for "max_volume: -xx.xx dB"
-    max_vol_line = None
+    max_db = None
     for line in stderr.splitlines():
         if "max_volume:" in line:
-            max_vol_line = line.strip()
+            try:
+                max_db = float(line.split("max_volume:")[1].strip().split(" ")[0])
+            except Exception:
+                max_db = None
             break
-    if max_vol_line:
-        try:
-            max_db = float(max_vol_line.split("max_volume:")[1].strip().split(" ")[0])
-        except Exception:
-            max_db = None
-    else:
-        max_db = None
 
-    # if audio is extremely quiet (max_db very negative), raise
     if max_db is not None and max_db < -45:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError("Audio seems silent or extremely quiet. Please provide a video with clearer audio.")
+        raise RuntimeError("Audio appears extremely quiet (max_volume < -45 dB). Provide a clearer video.")
 
-    # Normalize + boost using ffmpeg's loudnorm & volume (loudnorm gives good normalization)
-    # First apply loudnorm then apply small gain (+6 dB)
+    # normalize and lightly boost using ffmpeg loudnorm and a small volume gain
     cmd_norm = [
         "ffmpeg", "-y",
         "-i", raw_wav,
@@ -160,19 +114,25 @@ def extract_audio(video_path: str) -> Tuple[str, float, str]:
     ]
     _run_cmd(cmd_norm)
 
-    return clean_wav, duration_sec, tmp_dir
+    # simple check
+    if not os.path.exists(clean_wav) or os.path.getsize(clean_wav) < 1024:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError("Audio processing failed; normalized file missing or too small.")
+
+    # Return the clean audio path and duration (caller may choose to cleanup the temp dir)
+    return clean_wav, float(duration_sec)
 
 
 def transcribe_audio(audio_path: str) -> str:
     """
-    Split WAV into chunks using ffmpeg 'segment' and transcribe each chunk with Groq.
-    Removes chunk files after processing.
-    Returns concatenated transcript.
+    Split WAV into CHUNK_DURATION_SEC segments (ffmpeg) and transcribe each chunk with Groq Whisper.
+    Removes chunk files after processing and deletes chunk temp dir.
+    Returns concatenated transcript string.
     """
     audio_tmp_dir = tempfile.mkdtemp()
-    # build ffmpeg segment command
-    # -force_key_frames isn't needed for WAV; segment muxer will split by time
     segment_pattern = os.path.join(audio_tmp_dir, CHUNK_FILENAME)
+
+    # split into chunks; ensures 16000Hz mono pcm chunks
     cmd_segment = [
         "ffmpeg", "-y",
         "-i", audio_path,
@@ -185,11 +145,13 @@ def transcribe_audio(audio_path: str) -> str:
     ]
     _run_cmd(cmd_segment)
 
-    # get list of chunk files in sorted order
-    chunks = sorted([os.path.join(audio_tmp_dir, f) for f in os.listdir(audio_tmp_dir) if f.endswith(".wav")])
+    # collect chunk files sorted
+    chunks = sorted(
+        [os.path.join(audio_tmp_dir, f) for f in os.listdir(audio_tmp_dir) if f.endswith(".wav")]
+    )
     if not chunks:
         shutil.rmtree(audio_tmp_dir, ignore_errors=True)
-        raise RuntimeError("No audio chunks created by ffmpeg.")
+        raise RuntimeError("No audio chunks were produced by ffmpeg segmentation.")
 
     transcript_parts = []
     for chunk_path in chunks:
@@ -201,25 +163,19 @@ def transcribe_audio(audio_path: str) -> str:
                     response_format="text",
                 )
         except APIStatusError as e:
-            # cleanup chunk dir and raise
             shutil.rmtree(audio_tmp_dir, ignore_errors=True)
             raise RuntimeError(f"Transcription failed for chunk {chunk_path}: {e}")
 
         transcript_parts.append(str(part).strip())
-        # delete chunk immediately
+
+        # delete chunk once transcribed
         try:
             os.remove(chunk_path)
         except Exception:
             pass
 
-    # final cleanup for chunk directory
+    # cleanup chunk folder
     shutil.rmtree(audio_tmp_dir, ignore_errors=True)
 
-    return " ".join(p for p in transcript_parts if p)
-
-
-def cleanup_dirs(*dirs: str) -> None:
-    """Remove any temporary directories (ignore errors)."""
-    for d in dirs:
-        if d and os.path.exists(d):
-            shutil.rmtree(d, ignore_errors=True)
+    # combine and return
+    return " ".join(p for p in transcript_parts if p).strip()
