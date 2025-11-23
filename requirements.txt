@@ -1,6 +1,5 @@
 streamlit
 requests
-yt-dlp
 groq
 numpy
 nltk
