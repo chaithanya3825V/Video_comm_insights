@@ -1,5 +1,5 @@
 streamlit
-groq
-moviepy
-pydub
 requests
+yt-dlp
+groq
+numpy
