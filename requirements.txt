@@ -4,3 +4,4 @@ yt-dlp
 groq
 numpy
 moviepy
+pydub
