@@ -61,7 +61,7 @@ def download_video(url: str) -> str:
         raise RuntimeError("Downloaded file is missing or too small; ensure the URL is a direct public MP4 link.")
 
     # return the full path (caller may want to keep tmp_dir if cleanup needed)
-    return out_path
+    return out_path, tmp_dir
 
 
 def extract_audio(video_path: str) -> Tuple[str, float]:
@@ -120,7 +120,7 @@ def extract_audio(video_path: str) -> Tuple[str, float]:
         raise RuntimeError("Audio processing failed; normalized file missing or too small.")
 
     # Return the clean audio path and duration (caller may choose to cleanup the temp dir)
-    return clean_wav, float(duration_sec)
+    return clean_audio, float(duration_sec), tmp_dir
 
 
 def transcribe_audio(audio_path: str) -> str:
@@ -179,3 +179,11 @@ def transcribe_audio(audio_path: str) -> str:
 
     # combine and return
     return " ".join(p for p in transcript_parts if p).strip()
+    def cleanup_dirs(*dirs):
+    import shutil
+    for d in dirs:
+        if d and os.path.exists(d):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
