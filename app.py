@@ -1,4 +1,3 @@
-# app.py
 import os
 import traceback
 import streamlit as st
@@ -9,7 +8,6 @@ from analysis import analyze_transcript
 st.set_page_config(page_title="Video Communication Insights", layout="centered", page_icon="🎥")
 st.title("Video Communication Insights")
 
-# small helper: allow one-time API key paste if not set in env
 if not os.getenv("GROQ_API_KEY"):
     key = st.text_input("GROQ API Key (paste here for this session)", type="password")
     if key:
