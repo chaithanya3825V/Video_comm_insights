@@ -50,13 +50,29 @@ def _get_duration_seconds(path: str) -> float:
 
 
 # ---------- downloading ----------
+def _is_valid_mp4(path: str) -> bool:
+    """Return True if ffprobe can read duration — a quick validity check."""
+    try:
+        _run_cmd(["ffprobe", "-v", "error",
+                  "-show_entries", "format=duration",
+                  "-of", "default=noprint_wrappers=1:nokey=1",
+                  path])
+        return True
+    except Exception:
+        return False
+
+
 def download_video(url: str, tmp_prefix: Optional[str] = "video_") -> Tuple[str, str]:
     """
-    Download a video from URL to a temp dir and return (video_path, tmp_dir).
-    Uses yt-dlp when available; otherwise falls back to streaming direct MP4.
+    Robust download:
+    - Prefer yt-dlp for known platforms (handles YouTube, Vimeo, etc.)
+    - Otherwise stream-download with requests with retries, user-agent and timeout
+    - Validate file with ffprobe; retry once (or try yt-dlp fallback)
+    Returns (video_path, tmp_dir)
     """
     tmp_dir = tempfile.mkdtemp(prefix=tmp_prefix)
-    # prefer yt-dlp when available (handles youtube, vimeo, embeds)
+
+    # 1) try yt-dlp if available
     if ytdlp:
         outtmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
         ydl_opts = {
@@ -79,31 +95,82 @@ def download_video(url: str, tmp_prefix: Optional[str] = "video_") -> Tuple[str,
                         downloaded_path = alt
                 if not os.path.exists(downloaded_path):
                     files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)]
-                    if not files:
-                        raise RuntimeError("yt-dlp produced no files.")
-                    downloaded_path = max(files, key=os.path.getsize)
-                return downloaded_path, tmp_dir
-        except Exception as e:
-            # fall back to requests download
+                    if files:
+                        downloaded_path = max(files, key=os.path.getsize)
+                # validate
+                if _is_valid_mp4(downloaded_path):
+                    return downloaded_path, tmp_dir
+                # if invalid, continue to requests fallback
+        except Exception:
+            # continue to fallback
             pass
 
-    # requests fallback (for direct mp4 links)
+    # 2) requests streaming fallback (with retries and UA)
     out_path = os.path.join(tmp_dir, "video.mp4")
-    try:
-        with requests.get(url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            with open(out_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-    except Exception as e:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError(f"Failed to download video via requests fallback: {e}")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
 
-    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError("Downloaded file is missing or too small; ensure the URL is a direct public MP4 link.")
-    return out_path, tmp_dir
+    # try a couple of times if network is flaky
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with requests.get(url, stream=True, headers=headers, timeout=(10, 60)) as r:
+                r.raise_for_status()
+                # try to capture content-length (if provided)
+                content_length = r.headers.get("Content-Length")
+                with open(out_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            # quick file size sanity check
+            if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+                raise RuntimeError("Downloaded file too small or missing after streaming.")
+
+            # validate MP4 using ffprobe; if valid, return
+            if _is_valid_mp4(out_path):
+                return out_path, tmp_dir
+            else:
+                # file exists but not valid MP4
+                # remove and retry (or try yt-dlp next)
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
+                # if this was last attempt, break to try yt-dlp fallback below
+        except Exception as e:
+            # on transient network errors, retry
+            if attempt == max_attempts:
+                # final attempt failed; try yt-dlp (if available) as last resort
+                break
+            else:
+                continue
+
+    # 3) final: if yt-dlp exists, try it one more time (in case earlier attempt not used)
+    if ytdlp:
+        try:
+            outtmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+            ydl_opts = {"outtmpl": outtmpl, "format": "bestvideo+bestaudio/best", "merge_output_format": "mp4", "noplaylist": True, "quiet": True}
+            with ytdlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                downloaded_path = ydl.prepare_filename(info)
+                if not downloaded_path.lower().endswith(".mp4"):
+                    alt = os.path.splitext(downloaded_path)[0] + ".mp4"
+                    if os.path.exists(alt):
+                        downloaded_path = alt
+                if os.path.exists(downloaded_path) and _is_valid_mp4(downloaded_path):
+                    return downloaded_path, tmp_dir
+        except Exception:
+            pass
+
+    # nothing worked
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    raise RuntimeError(
+        "Unable to download a valid MP4 from the provided URL. "
+        "Possible causes: URL is not a direct MP4, server truncated the file, or the link requires authentication. "
+        "Try providing a direct MP4 URL or a YouTube link (yt-dlp supported)."
+    )
 
 
 # ---------- audio extraction ----------
