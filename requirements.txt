@@ -5,3 +5,4 @@ groq
 numpy
 moviepy
 pydub
+ffmpeg
