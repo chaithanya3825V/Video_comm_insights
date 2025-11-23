@@ -3,4 +3,5 @@ requests
 yt-dlp
 groq
 numpy
-moviepy
+nltk
+regex
