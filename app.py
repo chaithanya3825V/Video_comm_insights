@@ -1,96 +1,72 @@
-import streamlit as st
-from processing import download_video, extract_audio, transcribe_audio
-from text_features import clean_transcript, compute_filler_stats, compute_pace_wpm
-from analysis import analyze_transcript
+import os
+import tempfile
+import requests
+from moviepy import VideoFileClip
+from pydub import AudioSegment, effects
+from groq import Groq, APIStatusError
 
-# -------------------------------
-# Page config
-# -------------------------------
-st.set_page_config(
-    page_title="Video Communication Insights",
-    layout="wide",
-    page_icon="🎥"
-)
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-st.title("🎥 Video Communication Insights")
-st.write("Analyze communication clarity, focus, tone, and more from any MP4 video URL.")
+CHUNK_DURATION_MS = 50_000
 
 
-# -------------------------------
-# Input Section (No Sidebar Now)
-# -------------------------------
-st.subheader("Enter Video URL")
-url = st.text_input(
-    "🔗 MP4 Video URL:",
-    placeholder="Paste MP4 link here (must be a direct link)..."
-)
+def download_video(url: str) -> str:
+    tmp_dir = tempfile.mkdtemp()
+    out_path = os.path.join(tmp_dir, "video.mp4")
 
-analyze_button = st.button("🚀 Analyze Video")
+    r = requests.get(url, stream=True)
+    r.raise_for_status()
+
+    with open(out_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+
+    return out_path
 
 
-# -------------------------------
-# Processing Pipeline
-# -------------------------------
-if analyze_button:
-    if not url.strip():
-        st.error("❌ Please enter a valid MP4 video URL.")
-    else:
-        try:
-            # Step 1 — Download video
-            with st.spinner("📥 Downloading video..."):
-                video_path = download_video(url)
+def extract_audio(video_path: str) -> tuple[str, float]:
+    tmp_dir = tempfile.mkdtemp()
+    raw_audio = os.path.join(tmp_dir, "raw.wav")
+    clean_audio = os.path.join(tmp_dir, "clean.wav")
 
-            # Step 2 — Extract + clean audio
-            with st.spinner("🎧 Extracting and enhancing audio..."):
-                audio_path, duration_sec = extract_audio(video_path)
+    video = VideoFileClip(video_path)
+    video.audio.write_audiofile(raw_audio, fps=16000, codec="pcm_s16le")
+    duration_sec = video.duration
 
-            # Step 3 — Transcribe audio
-            with st.spinner("🔊 Transcribing audio (Whisper)..."):
-                raw_transcript = transcribe_audio(audio_path)
+    audio = AudioSegment.from_wav(raw_audio)
 
-            if not raw_transcript or len(raw_transcript.split()) < 3:
-                st.error("❌ Transcription resulted in very little text. Please try a clearer video.")
-            else:
-                cleaned_transcript = clean_transcript(raw_transcript)
-                filler_stats = compute_filler_stats(cleaned_transcript)
-                pace_wpm = compute_pace_wpm(filler_stats["total_words"], duration_sec)
+    if audio.dBFS < -45:
+        raise RuntimeError("Audio seems silent or extremely quiet. Please provide a video with clear speech.")
 
-                # Step 4 — LLM Communication Analysis
-                with st.spinner("🧠 Analyzing communication (LLaMA)..."):
-                    results = analyze_transcript(cleaned_transcript, filler_stats, pace_wpm)
+    normalized = effects.normalize(audio)
+    boosted = normalized + 8  # +8 dB
 
-                # -------------------------------
-                # Metrics Dashboard – Compact
-                # -------------------------------
-                st.subheader("📊 Communication Metrics")
+    boosted.export(clean_audio, format="wav")
+    return clean_audio, float(duration_sec)
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Clarity Score", f"{results['clarity_score']}%")
-                c2.metric("Speaking Pace", f"{pace_wpm} WPM")
-                c3.metric("Filler Density", f"{filler_stats['filler_density_per_100_words']} per 100 words")
 
-                c4, c5, c6 = st.columns(3)
-                c4.metric("Total Words", f"{filler_stats['total_words']}")
-                c5.metric("Sentiment", results.get("sentiment", "Unknown").capitalize())
-                c6.metric("Audio Duration", f"{round(duration_sec, 1)} sec")
+def transcribe_audio(audio_path: str) -> str:
 
-                # -------------------------------
-                # Insights
-                # -------------------------------
-                st.subheader("🎯 Communication Focus")
-                st.write(results["communication_focus"])
+    audio = AudioSegment.from_wav(audio_path)
+    transcript = ""
 
-                st.subheader("📚 Summary")
-                st.write(results["summary"])
+    for i in range(0, len(audio), CHUNK_DURATION_MS):
+        chunk = audio[i:i + CHUNK_DURATION_MS]
 
-                # -------------------------------
-                # Transcript Sections
-                # -------------------------------
-                with st.expander("📝 Raw Transcript"):
-                    st.write(raw_transcript)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            chunk.export(tmp.name, format="wav")
 
-                with st.expander("✨ Cleaned Transcript"):
-                    st.write(cleaned_transcript)
+            with open(tmp.name, "rb") as f:
+                try:
+                    part = client.audio.transcriptions.create(
+                        model="whisper-large-v3-turbo",
+                        file=f,
+                        response_format="text",
+                    )
+                except APIStatusError as e:
+                    raise RuntimeError(f"Transcription failed: {e}")
 
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
+        transcript += " " + part
+
+    return transcript.strip()
