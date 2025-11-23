@@ -1,4 +1,3 @@
-# processing.py
 import os
 import tempfile
 import shutil
@@ -8,10 +7,8 @@ import requests
 
 from groq import Groq, APIStatusError
 
-# Groq client will read API key from environment variable GROQ_API_KEY
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# seconds per chunk for transcription
 CHUNK_DURATION_SEC = 50
 CHUNK_FILENAME = "chunk_%03d.wav"
 
@@ -40,10 +37,6 @@ def _get_duration_seconds(path: str) -> float:
 
 
 def download_video(url: str, tmp_prefix: Optional[str] = "video_") -> Tuple[str, str]:
-    """
-    Download a direct MP4 URL into a temp directory.
-    Returns (video_path, tmp_dir).
-    """
     tmp_dir = tempfile.mkdtemp(prefix=tmp_prefix)
     out_path = os.path.join(tmp_dir, "video.mp4")
 
@@ -71,7 +64,6 @@ def download_video(url: str, tmp_prefix: Optional[str] = "video_") -> Tuple[str,
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError("Downloaded file missing or too small; ensure the URL is a direct MP4 link.")
 
-    # quick validation via ffprobe
     try:
         _get_duration_seconds(out_path)
     except Exception as e:
@@ -82,15 +74,10 @@ def download_video(url: str, tmp_prefix: Optional[str] = "video_") -> Tuple[str,
 
 
 def extract_audio(video_path: str, tmp_prefix: Optional[str] = "audio_") -> Tuple[str, float, str]:
-    """
-    Extract 16kHz mono WAV from the MP4, normalize and lightly boost.
-    Returns (clean_wav_path, duration_sec, tmp_dir).
-    """
     tmp_dir = tempfile.mkdtemp(prefix=tmp_prefix)
     raw_wav = os.path.join(tmp_dir, "raw.wav")
     clean_wav = os.path.join(tmp_dir, "clean.wav")
 
-    # extract audio
     cmd_extract = [
         "ffmpeg", "-y",
         "-i", video_path,
@@ -104,7 +91,6 @@ def extract_audio(video_path: str, tmp_prefix: Optional[str] = "audio_") -> Tupl
 
     duration_sec = _get_duration_seconds(raw_wav)
 
-    # optional loudness check (using volumedetect)
     probe_cmd = ["ffmpeg", "-i", raw_wav, "-af", "volumedetect", "-f", "null", "-"]
     proc = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stderr = proc.stderr.decode(errors="ignore")
@@ -121,7 +107,6 @@ def extract_audio(video_path: str, tmp_prefix: Optional[str] = "audio_") -> Tupl
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError("Audio appears extremely quiet (max_volume < -45 dB). Provide a clearer video.")
 
-    # normalize + small boost
     cmd_norm = [
         "ffmpeg", "-y",
         "-i", raw_wav,
@@ -138,10 +123,6 @@ def extract_audio(video_path: str, tmp_prefix: Optional[str] = "audio_") -> Tupl
 
 
 def transcribe_audio(audio_path: str) -> str:
-    """
-    Split WAV into chunks and transcribe each chunk via Groq Whisper.
-    Returns concatenated transcript string.
-    """
     audio_tmp_dir = tempfile.mkdtemp(prefix="chunks_")
     segment_pattern = os.path.join(audio_tmp_dir, CHUNK_FILENAME)
 
@@ -186,7 +167,6 @@ def transcribe_audio(audio_path: str) -> str:
 
 
 def cleanup_dirs(*dirs: Optional[str]) -> None:
-    """Remove provided temporary directories."""
     for d in dirs:
         if d and os.path.exists(d):
             try:
